@@ -415,6 +415,23 @@ func (co *consoleOperator) SyncTrustedCAConfigMap(ctx context.Context, operatorC
 	return actual, true, "", err
 }
 
+func (co *consoleOperator) SyncCustomLogoFilesConfigMap(ctx context.Context, operatorConfig *operatorv1.Console) (okToMount bool, reason string, err error) {
+    // Validate custom logo files
+    okToMount, reason, err = co.ValidateCustomLogoFiles(ctx, operatorConfig)
+    if !okToMount || err != nil {
+        return okToMount, reason, err
+    }
+
+    // Update custom logo sync source
+    err = co.UpdateCustomLogoFilesSyncSource(operatorConfig)
+    if err != nil {
+        return false, "FailedSyncSource", err
+    }
+
+    klog.V(4).Infoln("all custom logos ok to mount")
+    return true, "", nil
+}
+
 func (co *consoleOperator) SyncCustomLogoConfigMap(ctx context.Context, operatorConfig *operatorv1.Console) (okToMount bool, reason string, err error) {
 	// validate first, to avoid a broken volume mount & a crashlooping console
 	okToMount, reason, err = co.ValidateCustomLogo(ctx, operatorConfig)
@@ -461,6 +478,62 @@ func (c *consoleOperator) UpdateCustomLogoSyncSource(operatorConfig *operatorv1.
 		resourcesynccontroller.ResourceLocation{Namespace: api.OpenShiftConsoleNamespace, Name: api.OpenShiftCustomLogoConfigMapName},
 		source,
 	)
+}
+
+func (c *consoleOperator) UpdateCustomLogoFilesSyncSource(operatorConfig *operatorv1.Console) error {
+    for _, customLogoFile := range operatorConfig.Spec.Customization.CustomLogoFiles {
+        source := resourcesynccontroller.ResourceLocation{}
+        logoConfigMapName := customLogoFile.Name
+
+        if logoConfigMapName != "" {
+            source.Name = logoConfigMapName
+            source.Namespace = api.OpenShiftConfigNamespace
+        }
+        // if no custom logo provided, sync an empty source to delete
+        err := c.resourceSyncer.SyncConfigMap(
+            resourcesynccontroller.ResourceLocation{Namespace: api.OpenShiftConsoleNamespace, Name: api.OpenShiftCustomLogoConfigMapName},
+            source,
+        )
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func (co *consoleOperator) ValidateCustomLogoFiles(ctx context.Context, operatorConfig *operatorv1.Console) (okToMount bool, reason string, err error) {
+    for _, customLogoFile := range operatorConfig.Spec.Customization.CustomLogoFiles {
+        logoConfigMapName := customLogoFile.Name
+        logoImageKey := customLogoFile.Key
+
+        if configmapsub.FileNameOrKeyInconsistentlySet(customLogoFile) {
+            klog.V(4).Infoln("custom logo filename or key have not been set")
+            return false, "KeyOrFilenameInvalid", customerrors.NewCustomLogoError("either custom logo filename or key have not been set")
+        }
+        // fine if nothing set, but don't mount it
+        if configmapsub.FileNameNotSet(customLogoFile) {
+            klog.V(4).Infoln("no custom logo configured")
+            return false, "", nil
+        }
+        logoConfigMap, err := co.configMapClient.ConfigMaps(api.OpenShiftConfigNamespace).Get(ctx, logoConfigMapName, metav1.GetOptions{})
+        // If we 404, the logo file may not have been created yet.
+        if err != nil {
+            klog.V(4).Infof("custom logo file %v not found", logoConfigMapName)
+            return false, "FailedGet", customerrors.NewCustomLogoError(fmt.Sprintf("custom logo file %v not found", logoConfigMapName))
+        }
+
+        _, imageDataFound := logoConfigMap.BinaryData[logoImageKey]
+        if !imageDataFound {
+            _, imageDataFound = logoConfigMap.Data[logoImageKey]
+        }
+        if !imageDataFound {
+            klog.V(4).Infoln("custom logo file exists but no image provided")
+            return false, "NoImageProvided", customerrors.NewCustomLogoError("custom logo file exists but no image provided")
+        }
+    }
+
+    klog.V(4).Infoln("all custom logos ok to mount")
+    return true, "", nil
 }
 
 func (co *consoleOperator) ValidateCustomLogo(ctx context.Context, operatorConfig *operatorv1.Console) (okToMount bool, reason string, err error) {
